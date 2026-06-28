@@ -1,38 +1,14 @@
 import { useState } from 'react';
 import * as openpgp from 'openpgp';
-
-function CopyButton({ value }) {
-  const [copied, setCopied] = useState(false);
-
-  const handleCopy = async () => {
-    if (!value) return;
-    try {
-      await navigator.clipboard.writeText(value);
-    } catch {
-      // Fallback for browsers/contexts without the async clipboard API.
-      const ta = document.createElement('textarea');
-      ta.value = value;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      try {
-        document.execCommand('copy');
-      } catch {
-        /* ignore */
-      }
-      document.body.removeChild(ta);
-    }
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  return (
-    <button type="button" className="btn-secondary" onClick={handleCopy}>
-      {copied ? 'Copied!' : 'Copy'}
-    </button>
-  );
-}
+import CopyButton from './CopyButton.jsx';
+import {
+  LIMITS,
+  TIMEOUTS,
+  cleanLine,
+  overLimit,
+  withTimeout,
+  useRateLimiter,
+} from '../lib/safety.js';
 
 export default function GenerateKeys({ keyStore, setKeyStore }) {
   const [name, setName] = useState('');
@@ -42,14 +18,23 @@ export default function GenerateKeys({ keyStore, setKeyStore }) {
   const [privateKey, setPrivateKey] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const { check, record, cooling } = useRateLimiter();
 
   const alreadyLoaded = Boolean(keyStore.publicKey && keyStore.privateKey);
 
   const handleGenerate = async () => {
     setError('');
 
-    const trimmedName = name.trim();
-    const trimmedEmail = email.trim();
+    const gate = check();
+    if (!gate.ok) {
+      setError(gate.message);
+      return;
+    }
+
+    const trimmedName = cleanLine(name);
+    const trimmedEmail = cleanLine(email);
+    // Passphrase is preserved exactly (no trim/strip) — only length-capped.
+    const pass = typeof passphrase === 'string' ? passphrase : '';
 
     if (!trimmedName) {
       setError('Please enter a name.');
@@ -59,36 +44,49 @@ export default function GenerateKeys({ keyStore, setKeyStore }) {
       setError('Please enter an email address.');
       return;
     }
-    // Basic, permissive email sanity check.
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
       setError('Please enter a valid email address (e.g. alice@example.com).');
       return;
     }
-    if (!passphrase) {
+    if (!pass) {
       setError('Please enter a passphrase to protect the private key.');
       return;
     }
-    if (passphrase.length < 4) {
+    if (pass.length < 4) {
       setError('Please choose a passphrase of at least 4 characters.');
       return;
     }
 
+    const sizeError =
+      overLimit(trimmedName, LIMITS.name, 'Name') ||
+      overLimit(trimmedEmail, LIMITS.email, 'Email') ||
+      overLimit(pass, LIMITS.passphrase, 'Passphrase');
+    if (sizeError) {
+      setError(sizeError);
+      return;
+    }
+
+    record();
     setLoading(true);
     setPublicKey('');
     setPrivateKey('');
     try {
-      const result = await openpgp.generateKey({
-        type: 'rsa',
-        rsaBits: 2048,
-        userIDs: [{ name: trimmedName, email: trimmedEmail }],
-        passphrase,
-      });
+      const result = await withTimeout(
+        openpgp.generateKey({
+          type: 'rsa',
+          rsaBits: 2048,
+          userIDs: [{ name: trimmedName, email: trimmedEmail }],
+          passphrase: pass,
+        }),
+        TIMEOUTS.generate,
+        'Key generation'
+      );
       setPublicKey(result.publicKey);
       setPrivateKey(result.privateKey);
       setKeyStore({
         publicKey: result.publicKey,
         privateKey: result.privateKey,
-        passphrase,
+        passphrase: pass,
       });
     } catch (err) {
       setError(`Could not generate keys: ${err?.message || String(err)}`);
@@ -122,6 +120,7 @@ export default function GenerateKeys({ keyStore, setKeyStore }) {
             onChange={(e) => setName(e.target.value)}
             placeholder="Alice Example"
             autoComplete="off"
+            maxLength={LIMITS.name}
           />
         </label>
 
@@ -134,6 +133,7 @@ export default function GenerateKeys({ keyStore, setKeyStore }) {
             onChange={(e) => setEmail(e.target.value)}
             placeholder="alice@example.com"
             autoComplete="off"
+            maxLength={LIMITS.email}
           />
         </label>
 
@@ -146,6 +146,7 @@ export default function GenerateKeys({ keyStore, setKeyStore }) {
             onChange={(e) => setPassphrase(e.target.value)}
             placeholder="A long, memorable passphrase"
             autoComplete="new-password"
+            maxLength={LIMITS.passphrase}
           />
         </label>
 
@@ -153,7 +154,7 @@ export default function GenerateKeys({ keyStore, setKeyStore }) {
           type="button"
           className="btn-primary"
           onClick={handleGenerate}
-          disabled={loading}
+          disabled={loading || cooling}
         >
           {loading && <span className="spinner" aria-hidden="true" />}
           {loading ? 'Generating…' : 'Generate Key Pair'}

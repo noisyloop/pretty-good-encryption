@@ -1,37 +1,13 @@
 import { useState } from 'react';
 import * as openpgp from 'openpgp';
-
-function CopyButton({ value }) {
-  const [copied, setCopied] = useState(false);
-
-  const handleCopy = async () => {
-    if (!value) return;
-    try {
-      await navigator.clipboard.writeText(value);
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = value;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      try {
-        document.execCommand('copy');
-      } catch {
-        /* ignore */
-      }
-      document.body.removeChild(ta);
-    }
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  return (
-    <button type="button" className="btn-secondary" onClick={handleCopy}>
-      {copied ? 'Copied!' : 'Copy'}
-    </button>
-  );
-}
+import CopyButton from './CopyButton.jsx';
+import {
+  LIMITS,
+  cleanBlock,
+  overLimit,
+  withTimeout,
+  useRateLimiter,
+} from '../lib/safety.js';
 
 export default function Encrypt({ keyStore }) {
   const [publicKeyArmored, setPublicKeyArmored] = useState(
@@ -41,28 +17,53 @@ export default function Encrypt({ keyStore }) {
   const [ciphertext, setCiphertext] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const { check, record, cooling } = useRateLimiter();
 
   const handleEncrypt = async () => {
     setError('');
     setCiphertext('');
 
-    const key = publicKeyArmored.trim();
+    const gate = check();
+    if (!gate.ok) {
+      setError(gate.message);
+      return;
+    }
+
+    const key = cleanBlock(publicKeyArmored);
+    // Plaintext is preserved exactly (no trim/strip) — only length-capped.
+    const text = typeof plaintext === 'string' ? plaintext : '';
+
     if (!key) {
       setError('Please provide a public key.');
       return;
     }
-    if (!plaintext) {
+    if (!text) {
       setError('Please enter a message to encrypt.');
       return;
     }
 
+    const sizeError =
+      overLimit(key, LIMITS.key, 'Public key') ||
+      overLimit(text, LIMITS.message, 'Message');
+    if (sizeError) {
+      setError(sizeError);
+      return;
+    }
+
+    record();
     setLoading(true);
     try {
-      const publicKey = await openpgp.readKey({ armoredKey: key });
-      const encrypted = await openpgp.encrypt({
-        message: await openpgp.createMessage({ text: plaintext }),
-        encryptionKeys: publicKey,
-      });
+      const encrypted = await withTimeout(
+        (async () => {
+          const publicKey = await openpgp.readKey({ armoredKey: key });
+          return openpgp.encrypt({
+            message: await openpgp.createMessage({ text }),
+            encryptionKeys: publicKey,
+          });
+        })(),
+        undefined,
+        'Encryption'
+      );
       setCiphertext(encrypted);
     } catch (err) {
       setError(
@@ -110,7 +111,7 @@ export default function Encrypt({ keyStore }) {
           type="button"
           className="btn-primary"
           onClick={handleEncrypt}
-          disabled={loading}
+          disabled={loading || cooling}
         >
           {loading && <span className="spinner" aria-hidden="true" />}
           {loading ? 'Encrypting…' : 'Encrypt'}

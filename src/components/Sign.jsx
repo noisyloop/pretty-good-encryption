@@ -1,37 +1,13 @@
 import { useState } from 'react';
 import * as openpgp from 'openpgp';
-
-function CopyButton({ value }) {
-  const [copied, setCopied] = useState(false);
-
-  const handleCopy = async () => {
-    if (!value) return;
-    try {
-      await navigator.clipboard.writeText(value);
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = value;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      try {
-        document.execCommand('copy');
-      } catch {
-        /* ignore */
-      }
-      document.body.removeChild(ta);
-    }
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  return (
-    <button type="button" className="btn-secondary" onClick={handleCopy}>
-      {copied ? 'Copied!' : 'Copy'}
-    </button>
-  );
-}
+import CopyButton from './CopyButton.jsx';
+import {
+  LIMITS,
+  cleanBlock,
+  overLimit,
+  withTimeout,
+  useRateLimiter,
+} from '../lib/safety.js';
 
 export default function Sign({ keyStore }) {
   const [privateKeyArmored, setPrivateKeyArmored] = useState(
@@ -42,31 +18,58 @@ export default function Sign({ keyStore }) {
   const [signed, setSigned] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const { check, record, cooling } = useRateLimiter();
 
   const handleSign = async () => {
     setError('');
     setSigned('');
 
-    const key = privateKeyArmored.trim();
+    const gate = check();
+    if (!gate.ok) {
+      setError(gate.message);
+      return;
+    }
+
+    const key = cleanBlock(privateKeyArmored);
+    const pass = typeof passphrase === 'string' ? passphrase : '';
+    // Message is preserved exactly (no trim/strip) — only length-capped.
+    const text = typeof messageText === 'string' ? messageText : '';
+
     if (!key) {
       setError('Please provide a private key.');
       return;
     }
-    if (!messageText) {
+    if (!text) {
       setError('Please enter a message to sign.');
       return;
     }
 
+    const sizeError =
+      overLimit(key, LIMITS.key, 'Private key') ||
+      overLimit(pass, LIMITS.passphrase, 'Passphrase') ||
+      overLimit(text, LIMITS.message, 'Message');
+    if (sizeError) {
+      setError(sizeError);
+      return;
+    }
+
+    record();
     setLoading(true);
     try {
-      const privateKeyObj = await openpgp.decryptKey({
-        privateKey: await openpgp.readPrivateKey({ armoredKey: key }),
-        passphrase,
-      });
-      const result = await openpgp.sign({
-        message: await openpgp.createMessage({ text: messageText }),
-        signingKeys: privateKeyObj,
-      });
+      const result = await withTimeout(
+        (async () => {
+          const privateKeyObj = await openpgp.decryptKey({
+            privateKey: await openpgp.readPrivateKey({ armoredKey: key }),
+            passphrase: pass,
+          });
+          return openpgp.sign({
+            message: await openpgp.createMessage({ text }),
+            signingKeys: privateKeyObj,
+          });
+        })(),
+        undefined,
+        'Signing'
+      );
       setSigned(result);
     } catch (err) {
       setError(
@@ -108,6 +111,7 @@ export default function Sign({ keyStore }) {
             onChange={(e) => setPassphrase(e.target.value)}
             placeholder="The passphrase that protects your private key"
             autoComplete="off"
+            maxLength={LIMITS.passphrase}
           />
         </label>
 
@@ -126,7 +130,7 @@ export default function Sign({ keyStore }) {
           type="button"
           className="btn-primary"
           onClick={handleSign}
-          disabled={loading}
+          disabled={loading || cooling}
         >
           {loading && <span className="spinner" aria-hidden="true" />}
           {loading ? 'Signing…' : 'Sign'}
