@@ -1,5 +1,12 @@
 import { useState } from 'react';
 import * as openpgp from 'openpgp';
+import {
+  LIMITS,
+  cleanBlock,
+  overLimit,
+  withTimeout,
+  useRateLimiter,
+} from '../lib/safety.js';
 
 export default function Verify({ keyStore }) {
   const [publicKeyArmored, setPublicKeyArmored] = useState(
@@ -9,13 +16,20 @@ export default function Verify({ keyStore }) {
   const [result, setResult] = useState(null); // { valid: boolean, detail: string }
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const { check, record, cooling } = useRateLimiter();
 
   const handleVerify = async () => {
     setError('');
     setResult(null);
 
-    const key = publicKeyArmored.trim();
-    const armoredMessage = signedMessage.trim();
+    const gate = check();
+    if (!gate.ok) {
+      setError(gate.message);
+      return;
+    }
+
+    const key = cleanBlock(publicKeyArmored);
+    const armoredMessage = cleanBlock(signedMessage);
 
     if (!key) {
       setError('Please provide a public key.');
@@ -26,14 +40,30 @@ export default function Verify({ keyStore }) {
       return;
     }
 
+    const sizeError =
+      overLimit(key, LIMITS.key, 'Public key') ||
+      overLimit(armoredMessage, LIMITS.message, 'Signed message');
+    if (sizeError) {
+      setError(sizeError);
+      return;
+    }
+
+    record();
     setLoading(true);
     try {
-      const publicKey = await openpgp.readKey({ armoredKey: key });
-      const message = await openpgp.readMessage({ armoredMessage });
-      const { signatures } = await openpgp.verify({
-        message,
-        verificationKeys: publicKey,
-      });
+      const signatures = await withTimeout(
+        (async () => {
+          const publicKey = await openpgp.readKey({ armoredKey: key });
+          const message = await openpgp.readMessage({ armoredMessage });
+          const verified = await openpgp.verify({
+            message,
+            verificationKeys: publicKey,
+          });
+          return verified.signatures;
+        })(),
+        undefined,
+        'Verification'
+      );
 
       if (!signatures || signatures.length === 0) {
         setResult({
@@ -46,7 +76,7 @@ export default function Verify({ keyStore }) {
       // Awaiting `verified` throws if the signature is invalid or made by a
       // different key, so catch that specifically and report an INVALID result.
       try {
-        await signatures[0].verified;
+        await withTimeout(signatures[0].verified, undefined, 'Verification');
         setResult({
           valid: true,
           detail:
@@ -108,7 +138,7 @@ export default function Verify({ keyStore }) {
           type="button"
           className="btn-primary"
           onClick={handleVerify}
-          disabled={loading}
+          disabled={loading || cooling}
         >
           {loading && <span className="spinner" aria-hidden="true" />}
           {loading ? 'Verifying…' : 'Verify'}
